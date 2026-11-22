@@ -8,6 +8,7 @@ already been handed to a node agent.
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import time
@@ -75,6 +76,39 @@ CREATE TABLE IF NOT EXISTS report_events (
 );
 """
 
+# Data repair for databases created before ``DELETE /pods/{uid}`` was made
+# non-destructive for already-evicted pods.
+#
+# Older builds let the supplementary pod deletion overwrite a pod that a node
+# agent had already reported as successfully evicted: the pod was relabelled
+# ``removed`` and its ``retired_at`` replaced with the deletion time.  Such a
+# row is recognisable because the pod has a ``succeeded`` eviction task, which
+# a genuine manual removal cannot have (a manual removal aborts the open task,
+# and a late success on a settled task is ignored).  Restore it to
+# ``evicted`` and take the retirement time from that task's settlement.
+#
+# This touches ``pods`` only: task history and stored report decisions are
+# preserved.  The statement is idempotent, so it is safe to run on every start
+# and to retry after a failure.
+REPAIR_MISCLASSIFIED_REMOVALS = """
+UPDATE pods
+   SET state = 'evicted',
+       ready = 0,
+       retired_at = (
+           SELECT COALESCE(t.resolved_at, t.updated_at)
+             FROM eviction_tasks t
+            WHERE t.pod_uid = pods.uid AND t.status = 'succeeded'
+            ORDER BY COALESCE(t.resolved_at, t.updated_at) DESC,
+                     t.created_at DESC
+            LIMIT 1
+       )
+ WHERE state = 'removed'
+   AND EXISTS (
+       SELECT 1 FROM eviction_tasks t
+        WHERE t.pod_uid = pods.uid AND t.status = 'succeeded'
+   )
+"""
+
 
 def db_path_from_env() -> Path:
     return Path(os.environ.get("DRAIN_DB_PATH", str(DEFAULT_DB_PATH)))
@@ -99,6 +133,18 @@ def connect(path: str | Path) -> sqlite3.Connection:
     return conn
 
 
+def repair_misclassified_removals(conn: sqlite3.Connection) -> int:
+    """Restore pods that a late manual delete wrongly relabelled ``removed``.
+
+    Runs as one ``BEGIN IMMEDIATE`` transaction: either every affected pod is
+    restored, or the database is left exactly as it was (the caller fails the
+    start-up and a later restart retries).
+    """
+    with transaction(conn, immediate=True):
+        cur = conn.execute(REPAIR_MISCLASSIFIED_REMOVALS)
+        return max(cur.rowcount, 0)
+
+
 def init_db(path: str | Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -112,6 +158,17 @@ def init_db(path: str | Path) -> None:
             # executescript() has its own COMMIT handling; the schema is
             # idempotent and safe to run on every start.
             conn.executescript(SCHEMA)
+            # Upgrade old volumes before this worker serves its first request.
+            # Concurrent workers serialise on the write lock; after the first
+            # one commits, the rest find nothing left to repair.
+            repaired = repair_misclassified_removals(conn)
+            if repaired:
+                # uvicorn configures the ``uvicorn`` logger tree, so an INFO
+                # line here reaches the server log without extra setup.  When
+                # embedded elsewhere it simply goes to the root logger.
+                logging.getLogger("uvicorn.error").info(
+                    "restored %d misclassified removed pod(s) to evicted", repaired
+                )
             return
         except sqlite3.OperationalError as exc:  # pragma: no cover - timing
             last = exc

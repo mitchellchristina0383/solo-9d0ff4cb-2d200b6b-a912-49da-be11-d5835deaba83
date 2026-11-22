@@ -124,3 +124,97 @@ built here.
   reports the result or a future reaper times them out. A timeout-based reaper
   is the obvious next addition.
 * No pagination on list endpoints.
+
+## 10. Eviction success vs. `DELETE /pods/{uid}` reconciliation (revision)
+
+Requirement: the node agent's success report and an inspection job's
+`DELETE /pods/{uid}` race on the same pod. Verified against a real
+`python -m app.main` server (2 uvicorn workers, shared SQLite file) and in the
+unit suite. New tests are in `tests/test_reconcile.py`.
+
+### 10.1 Success commits first, delete arrives later
+
+```
+after success: evicted 2026-11-22T12:51:54.137Z task succeeded
+after DELETE:  evicted 2026-11-22T12:51:54.137Z
+workload: {'evicted': 1, 'removed': 0, 'effective_ready': 1}
+PASS
+```
+
+`state` stays `evicted`, `retired_at` keeps the task settlement time, the task
+stays `succeeded`, and the workload's evicted count stays 1 (previously the
+delete rewrote the pod to `removed`, moved `retired_at` and dropped the count).
+
+### 10.2 Delete commits first, late success arrives
+
+```
+after DELETE: removed | task: aborted pod_removed
+late success: applied=False ignored_reason=task_already_resolved
+workload: {'evicted': 0, 'removed': 1, 'reserved': 0}
+PASS
+```
+
+Unchanged pre-existing behaviour: the open task is aborted with
+`result_note=pod_removed`, and the late success is acknowledged but inert.
+
+### 10.3 Old-volume upgrade
+
+An API-built evicted pod was mutated into the old bug shape
+(`state=removed`, `retired_at=2099-01-01…`), alongside a genuine manual
+removal and a normal eviction. Restarting two workers on that file:
+
+```
+old-volume state before upgrade: {'c1-0': 'removed', 'c1-1': 'active',
+                                   'm-0': 'removed', 'o-0': 'evicted'}
+docs: 200
+repaired pod: evicted 2026-11-22T12:51:58.347Z expected 2026-11-22T12:51:58.347Z
+workloads: {'web': (1, 0), 'manual': (0, 1), 'other': (1, 0)}
+state=evicted: ['c1-0', 'o-0']
+state=removed: ['m-0']
+genuine-removal task: aborted pod_removed
+PASS
+```
+
+The misclassified pod is `evicted` again with the success task's settlement
+time; the genuine removal stays `removed`; task and `report_events` history is
+untouched; `/pods/{uid}`, `?state=` and the workload counters all reflect the
+repair from the first request.
+
+### 10.4 Batch atomicity, retry and multi-worker start
+
+Covered by pytest:
+
+* `test_repair_rolls_back_all_rows_on_failure` — a failure injected after the
+  update statement but before commit leaves **both** affected rows untouched.
+* `test_old_volume_repair_is_atomic_and_retryable` — after a failed start the
+  data is unchanged; the next `init_db` repairs it.
+* `test_multiple_workers_share_old_volume_and_see_repaired_state` — four
+  concurrent spawned processes call `init_db` on one old volume behind a
+  barrier; each observes `evicted` + the correct `retired_at` + count 1.
+* `test_old_volume_repair_is_idempotent` — a second start changes nothing.
+
+### 10.5 Suite
+
+```
+$ python -m pytest -q
+31 passed
+$ python -m pyflakes app tests scripts
+(clean)
+```
+
+Docker is still not installed in this sandbox, so `docker compose up` was not
+executed here; the same entrypoint (`python -m app.main`, 2 workers, shared
+`DRAIN_DB_PATH`, `/docs` served) was run natively as above. On the Compose
+host the same checks run against the exposed port:
+
+```bash
+docker compose up --build -d
+python scripts/verify_reconcile.py --base http://127.0.0.1:8000
+docker compose stop
+python scripts/verify_reconcile.py --seed-legacy --db-path <host path to drain.db>
+docker compose start
+curl -s localhost:8000/pods/<uid>      # evicted + original retired_at
+```
+
+A repaired start logs `restored N misclassified removed pod(s) to evicted`
+through uvicorn's logger (visible with `docker compose logs drain-api`).

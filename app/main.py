@@ -44,6 +44,13 @@ workload keeps enough ready replicas.
 * An eviction that succeeds runs the pod down; only a ready *replacement* pod
   adds capacity back. An aborted eviction returns the original pod to the
   count according to its actual current readiness.
+* `DELETE /pods/{uid}` is a supplementary observation for a pod that vanished
+  out of band. If the node's `succeeded` report already retired it, the pod
+  stays `evicted` with its eviction settlement time; a later delete never
+  relabels it `removed`, never rewrites `retired_at`, and never reduces the
+  workload's evicted count. If the manual removal commits first, the
+  pre-existing rules apply: its open tasks are aborted and a late success is
+  ignored.
 * Reports are fenced by an optional idempotency `report_id` and by task
   identity. A report for an already-settled task is acknowledged but changes
   nothing, and can never touch a newer task or resurrect a removed pod.
@@ -197,6 +204,13 @@ def get_pod(uid: str) -> PodOut:
     response_model=PodOut,
     tags=["pods"],
     summary="Retire a pod that disappeared out of band",
+    description=(
+        "Supplementary observation, not an authoritative eviction outcome. "
+        "If a node already reported `succeeded` for this pod, it stays "
+        "`evicted` with its settlement `retired_at`; this call changes "
+        "nothing. Otherwise it retires the pod as `removed` and aborts any "
+        "open eviction task."
+    ),
 )
 def delete_pod(uid: str) -> PodOut:
     try:

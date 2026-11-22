@@ -110,6 +110,23 @@ This is recomputed from the database, so it holds after a crash or restart.
   a new pod counts only once it is ready.
 * **Abort restores reality.** The original pod is counted per its latest
   readiness report, not per the state at dispatch time.
+* **A late delete cannot undo a successful eviction.** `DELETE /pods/{uid}`
+  is only a supplementary observation that a pod vanished out of band. When
+  the node's `succeeded` report committed first, the pod stays `evicted` with
+  the task's settlement time as `retired_at`; the delete does not relabel it
+  `removed`, does not move `retired_at`, and does not change the workload's
+  `evicted` / `removed` counts. When the manual removal commits first, the
+  usual rules apply: its open task is aborted and a late success is ignored.
+* **Old volumes are repaired on start.** A database written by an earlier
+  build can contain a pod with a `succeeded` eviction task that was later
+  relabelled `removed` by such a delete. That is impossible under the rules
+  above, so on start-up the service restores every such pod to `evicted` and
+  sets `retired_at` from the task's settlement time. Genuine removals, task
+  history and stored report decisions are untouched. The repair runs as one
+  `BEGIN IMMEDIATE` transaction: it applies to the whole batch or not at all,
+  a failed start leaves the data unchanged, and the next restart retries.
+  Multiple workers on the same volume serialise on the write lock and see the
+  repaired rows from their first query.
 * **Stale reports are inert.** A report on an already-settled task is
   acknowledged (`applied: false`) and cannot change a newer task, retire a
   replacement, or resurrect a removed pod. Readiness reports on removed or
@@ -127,7 +144,7 @@ This is recomputed from the database, so it holds after a crash or restart.
 | `GET` | `/nodes` | List nodes |
 | `PUT` | `/pods/{uid}` | Register/update a pod |
 | `GET` | `/pods?node=&workload=&state=` | List pods |
-| `GET` | `/pods/{uid}`, `DELETE /pods/{uid}` | Inspect / retire a pod |
+| `GET` | `/pods/{uid}`, `DELETE /pods/{uid}` | Inspect / retire a pod (no-op if already evicted) |
 | `POST` | `/pods/{uid}/readiness` | Report readiness (optional `report_id`) |
 | `POST` | `/drain/claims` | Claim evictions for a node |
 | `POST` | `/drain/tasks/{id}/result` | Report `succeeded` / `aborted` |

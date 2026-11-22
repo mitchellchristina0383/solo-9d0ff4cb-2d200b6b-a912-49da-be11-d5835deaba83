@@ -436,13 +436,29 @@ def list_pods(
 
 
 def remove_pod(uid: str) -> PodOut:
-    """Explicitly retire a pod (e.g. it was deleted out of band)."""
+    """Explicitly retire a pod (e.g. it was deleted out of band).
+
+    This is a *supplementary* observation, not an authoritative outcome.  A
+    node agent's ``succeeded`` report may already have retired the pod; when
+    that happens first, the pod is ``evicted`` and its ``retired_at`` is the
+    settlement time of the successful task.  An inspection job that later
+    issues ``DELETE /pods/{uid}`` for the same (now gone) pod must not
+    reclassify it as a manual removal or overwrite that retirement time, so
+    the call is idempotent once the pod has been evicted.
+
+    If the manual removal commits first instead, the existing rules still
+    apply: open tasks are aborted and a late success is ignored.
+    """
     conn = _connect()
     try:
         with db.transaction(conn, immediate=True):
             row = conn.execute("SELECT * FROM pods WHERE uid = ?", (uid,)).fetchone()
             if row is None:
                 raise NotFound(f"pod {uid!r} not found")
+            if row["state"] == EVICTED:
+                # The eviction outcome is authoritative.  Do not reclassify,
+                # do not rewrite retired_at, and do not touch the settled task.
+                return _pod_out(conn, row)
             if row["state"] != REMOVED:
                 ts = now_iso()
                 conn.execute(
